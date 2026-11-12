@@ -1,8 +1,8 @@
 # LIMS 检测结果同步平台
 
 检测实验室数据工程师的入库工具:将 LIMS 导出的**全量结果**与**复测更正/撤回增量**同步入库,
-为报告系统提供一致的取数接口。Flask 提供上传与进度页面,SQLite 持久保存导入记录、
-装载进度与正式结果表。
+为报告系统提供一致的取数接口,并支持把某报告号下的必需项目**冻结成交付包**对外交付。
+Flask 提供上传、进度与交付包页面,SQLite 持久保存导入记录、装载进度、正式结果表与交付包。
 
 ## 快速启动
 
@@ -52,6 +52,24 @@ python -m pytest tests/ -q
 
 可随时点击 **读取当前有效结果** 演示报告系统取数;**含撤回墓碑** 可查看撤回水位。
 
+## 交付包(向报告系统交付)
+
+打开 **交付包页面**(首页头部链接,或 `GET /packages`):
+
+1. 输入**报告号**与 **1~20 个不重复的必需项目**(每行一个或逗号分隔,可先点
+   "查看该报告当前正式结果"核对)。建包读取**当前正式结果**;
+2. 任一项目**缺失**或**已撤回**时,页面逐项列明原因,**不建包**(接口返回 422);
+3. 项目齐全时,冻结所选项目的**结果值与修订号**存入 SQLite,凭包号下载 CSV
+   (UTF-8 带 BOM,Excel 可直接打开);
+4. 此后**增量确认**或**全量基线切换**只要改变了包内任一项目的结果值、修订号或
+   有效性(撤回/切换后消失),该包即被**永久停用**,下载请求被拒绝(410);
+   未选项目、其他报告的变更,以及被忽略的旧增量(stale/仅记录水位的撤回)不影响它;
+5. 已停用的包不会因后来结果改回原值而恢复可用;需要时可基于当前正式结果另建新包。
+
+演示:载入 **全量基线 v1** → 交付包页面为 `R2026-0001` 建包(项目 `铅(Pb)`、`镉(Cd)`)
+→ 下载 CSV → 载入 **增量·更正**(`R2026-0001 铅` 被更正)→ 列表中包变为"已停用",
+下载被拒。
+
 ## CSV 格式
 
 表头支持英文或中文(可混用),UTF-8(兼容 BOM):
@@ -86,6 +104,7 @@ python -m pytest tests/ -q
 | 方法/路径 | 说明 |
 |---|---|
 | `GET /` | 演示页面(上传、进度、取数) |
+| `GET /packages` | **交付包页面**(建包、状态查看、下载) |
 | `POST /upload/full` | 上传全量 CSV(multipart `file`),后台装载;已有装载进行中返回 `409` |
 | `POST /upload/inc` | 上传增量 CSV,请求内同步确认,响应返回时已更新正式表 |
 | `POST /load_sample/<name>` | 载入随附示例(`full_baseline`、`inc_corrections`、`inc_withdrawals`、`inc_after_withdraw`、`full_large`、`inc_during_load`、`full_baseline_v2`) |
@@ -93,6 +112,10 @@ python -m pytest tests/ -q
 | `GET /api/batches` | 导入批次与进度(全量/增量、状态、行数、百分比) |
 | `GET /api/increments` | 已确认增量日志(全局序号、动作、效果) |
 | `GET /api/status` | 汇总:有效结果数、墓碑数、增量数、是否有装载进行中 |
+| `POST /packages` | 建包:JSON `{"report_no": "...", "items": ["...", ...]}`;项目缺失/已撤回返回 `422` 并逐项列明原因;参数非法返回 `400` |
+| `GET /api/packages` | 交付包列表(状态、冻结项目数、停用时间/原因) |
+| `GET /api/packages/<id>` | 包明细(冻结的项目、结果、修订号) |
+| `GET /packages/<id>/download` | 下载包 CSV;包已停用返回 `410` |
 | `GET /api/health` | 健康检查 |
 
 取数接口为单条 `SELECT`(WAL 快照读),每次读取均为**切换前或切换后的完整有效结果**,
@@ -110,19 +133,27 @@ python -m pytest tests/ -q
   强制同一时刻至多一个全量装载,冲突返回 409。
 - **即时生效**:增量在上传请求内同步确认,立即更新现有正式表,与后台装载并行不悖
   (SQLite 写事务串行化 + busy_timeout,WAL 下读不阻塞)。
+- **建包不留过时包**:建包在 `BEGIN IMMEDIATE` 事务内读取正式结果并写入交付包,
+  与任何结果变更互斥;并发下不存在"已过时却可用"的包。
+- **变更与停用原子提交**:增量确认(`confirm_increment`)与基线切换
+  (`merge_and_switch`)在同一事务内停用受影响的交付包;进程中断则整体回滚,
+  重启恢复后重做,结果与包状态始终一致。
+- **永久停用**:停用是持久状态位而非下载时实时比对——结果后来改回原值,
+  已停用的包也不会重新可用。
 
 ## 目录结构
 
 ```
 app/
   __init__.py   应用工厂(启动时触发恢复)
-  db.py         SQLite 连接与表结构(batches/results/results_staging/increments)
-  logic.py      修订裁决、撤回墓碑、合并切换、CSV 解析
+  db.py         SQLite 连接与表结构(batches/results/results_staging/increments/packages/package_items)
+  logic.py      修订裁决、撤回墓碑、合并切换、交付包建包/停用、CSV 解析
   loader.py     后台装载、断点续传、崩溃恢复、单装载调度
-  routes.py     上传/进度/取数接口与页面
-  templates/index.html
+  routes.py     上传/进度/取数/交付包接口与页面
+  templates/index.html      上传与取数演示页
+  templates/packages.html   交付包页面(建包、状态、下载)
 samples/        全量与装载中更正/撤回示例文件
-tests/          21 个用例:语义、切换、恢复、单装载、接口
+tests/          35 个用例:语义、切换、恢复、单装载、接口、交付包
 wsgi.py         gunicorn wsgi:app
 Dockerfile / docker-compose.yml
 ```

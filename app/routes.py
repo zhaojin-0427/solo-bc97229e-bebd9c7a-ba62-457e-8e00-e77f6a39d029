@@ -1,9 +1,12 @@
-"""HTTP 接口:上传、进度、取数、页面。"""
+"""HTTP 接口:上传、进度、取数、交付包、页面。"""
+import csv
+import io
 import os
 import sqlite3
 import uuid
 
-from flask import (Blueprint, current_app, jsonify, render_template, request)
+from flask import (Blueprint, Response, current_app, jsonify, render_template,
+                   request)
 
 from . import db, loader, logic
 
@@ -93,6 +96,11 @@ def _poke(app):
 @bp.get("/")
 def index():
     return render_template("index.html", samples=sorted(SAMPLE_FILES.keys()))
+
+
+@bp.get("/packages")
+def packages_page():
+    return render_template("packages.html")
 
 
 # ------------------------------------------------------------------ 上传
@@ -214,3 +222,73 @@ def api_status():
 @bp.get("/api/health")
 def api_health():
     return jsonify({"ok": True})
+
+
+# ------------------------------------------------------------------ 交付包
+
+def _package_json(row, items=None):
+    d = {
+        "id": row["id"], "report_no": row["report_no"], "status": row["status"],
+        "item_count": row["item_count"], "created_at": row["created_at"],
+        "disabled_at": row["disabled_at"], "disabled_reason": row["disabled_reason"],
+    }
+    if items is not None:
+        d["items"] = [dict(i) for i in items]
+    return d
+
+
+@bp.post("/packages")
+def create_package():
+    """建包:JSON {report_no, items:[...]}。项目缺失/已撤回时列明原因(422),不建包。"""
+    data = request.get_json(silent=True) or {}
+    items = data.get("items")
+    if not isinstance(items, list):
+        return _err("items 必须为字符串数组")
+    try:
+        pid, problems = logic.create_package(
+            db.get_db(), data.get("report_no"), items)
+    except logic.PackageError as exc:
+        return _err(str(exc))
+    if problems:
+        return jsonify({"ok": False,
+                        "error": "以下必需项目缺失或已撤回,未建包",
+                        "problems": problems}), 422
+    pkg = logic.get_package(db.get_db(), pid)
+    return jsonify({"ok": True, "package": _package_json(pkg),
+                    "message": f"交付包 #{pid} 已创建,冻结 {pkg['item_count']} 个项目"})
+
+
+@bp.get("/api/packages")
+def api_packages():
+    rows = logic.list_packages(db.get_db())
+    return jsonify({"packages": [_package_json(r) for r in rows]})
+
+
+@bp.get("/api/packages/<int:pid>")
+def api_package_detail(pid):
+    conn = db.get_db()
+    pkg = logic.get_package(conn, pid)
+    if pkg is None:
+        return _err(f"交付包不存在: #{pid}", 404)
+    return jsonify({"package": _package_json(pkg, logic.package_items(conn, pid))})
+
+
+@bp.get("/packages/<int:pid>/download")
+def download_package(pid):
+    """凭包号下载冻结快照 CSV;已停用的包拒绝下载(410)。"""
+    conn = db.get_db()
+    pkg = logic.get_package(conn, pid)
+    if pkg is None:
+        return _err(f"交付包不存在: #{pid}", 404)
+    if pkg["status"] != "active":
+        return jsonify({"ok": False,
+                        "error": f"交付包 #{pid} 已停用,不可下载",
+                        "reason": pkg["disabled_reason"]}), 410
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(["report_no", "item", "result", "revision"])
+    for it in logic.package_items(conn, pid):
+        w.writerow([pkg["report_no"], it["item"], it["result"], it["revision"]])
+    return Response(buf.getvalue().encode("utf-8-sig"), mimetype="text/csv",
+                    headers={"Content-Disposition":
+                             f"attachment; filename=package_{pid}.csv"})

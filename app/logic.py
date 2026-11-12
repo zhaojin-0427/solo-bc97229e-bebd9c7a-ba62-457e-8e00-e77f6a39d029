@@ -170,25 +170,31 @@ def stage_full_row(conn, report_no, item, result, revision):
 # ---------------------------------------------------------------- 增量确认
 
 def confirm_increment(conn, batch_id, report_no, item, action, result, revision):
-    """确认一条增量:写日志 + 立即应用到正式表(须在事务内调用)。
+    """确认一条增量:写日志 + 应用到正式表 + 停用受影响交付包(同一事务)。
 
-    返回 (seq, effect)。
+    返回 (seq, effect)。只有真正改变正式结果(结果值/修订号/有效性)的
+    增量才停用交付包;被忽略的 stale/recorded 增量不影响任何包。
     """
-    cur = conn.execute("SELECT revision, withdrawn_rev, active FROM results "
-                       "WHERE report_no=? AND item=?", (report_no, item))
-    old = cur.fetchone()
+    old = conn.execute("SELECT revision, withdrawn_rev, active FROM results "
+                       "WHERE report_no=? AND item=?", (report_no, item)).fetchone()
     if action == CORRECT:
         applied = apply_correction(conn, "results", report_no, item, result, revision)
         effect = "applied" if applied else "stale"
+        changed = applied
+        reason = f"增量批次#{batch_id} 更正了项目「{item}」(修订号 {revision})"
     else:
         was_active = bool(old and old["active"])
         apply_withdrawal(conn, "results", report_no, item, revision)
-        effect = "withdrawn" if (was_active and revision >= old["revision"]) else "recorded"
+        changed = bool(was_active and revision >= old["revision"])
+        effect = "withdrawn" if changed else "recorded"
+        reason = f"增量批次#{batch_id} 撤回了项目「{item}」(修订号 {revision})"
     cur = conn.execute(
         "INSERT INTO increments (batch_id, report_no, item, action, result, revision, effect)"
         " VALUES (?, ?, ?, ?, ?, ?, ?)",
         (batch_id, report_no, item, action, result if action == CORRECT else None, revision, effect),
     )
+    if changed:
+        disable_packages_for_item(conn, report_no, item, reason)
     return cur.lastrowid, effect
 
 
@@ -238,6 +244,27 @@ def merge_and_switch(conn, batch_id):
         " SELECT report_no, item, result, revision, withdrawn_rev, active FROM results_staging"
     )
     conn.execute("DELETE FROM results_staging")
+
+    # 4) 交付包重校验(与切换同事务):包内任一项目的结果值/修订号/有效性
+    #    在新基线中不再一致(含被移除、被撤回)=> 整包永久停用。
+    conn.execute(
+        """
+        UPDATE packages
+           SET status='disabled', disabled_at=datetime('now'), disabled_reason=?
+         WHERE status='active' AND EXISTS (
+             SELECT 1 FROM package_items pi
+              WHERE pi.package_id = packages.id
+                AND NOT EXISTS (
+                    SELECT 1 FROM results r
+                     WHERE r.report_no = packages.report_no
+                       AND r.item = pi.item
+                       AND r.active = 1
+                       AND r.result = pi.result
+                       AND r.revision = pi.revision))
+        """,
+        (f"全量批次#{batch_id} 基线切换:包内项目的结果/修订号/有效性已变化",),
+    )
+
     conn.execute(
         "UPDATE batches SET status='done', updated_at=datetime('now') WHERE id=?",
         (batch_id,),
@@ -265,3 +292,111 @@ def current_results(conn, report_no=None, include_withdrawn=False):
 def max_increment_seq(conn):
     row = conn.execute("SELECT COALESCE(MAX(seq), 0) AS s FROM increments").fetchone()
     return row["s"]
+
+
+# ---------------------------------------------------------------- 交付包
+
+MAX_PACKAGE_ITEMS = 20
+
+
+class PackageError(Exception):
+    """建包请求参数非法(报告号空、项目数越界、项目重复等)。"""
+
+
+def normalize_items(raw_items):
+    """去空白、去空项、去重;返回 (items, duplicates)。"""
+    items, seen, dups = [], set(), []
+    for raw in raw_items:
+        it = str(raw or "").strip()
+        if not it:
+            continue
+        if it in seen:
+            if it not in dups:
+                dups.append(it)
+            continue
+        seen.add(it)
+        items.append(it)
+    return items, dups
+
+
+def create_package(conn, report_no, raw_items):
+    """建包:在 BEGIN IMMEDIATE 事务内读取正式结果并冻结,与结果变更互斥,
+    不会建出"已过时却可用"的包。
+
+    返回 (package_id, problems);problems 非空(项目缺失/已撤回)则不建包。
+    参数非法抛 PackageError。
+    """
+    report_no = (report_no or "").strip()
+    if not report_no:
+        raise PackageError("报告号不能为空")
+    items, dups = normalize_items(raw_items)
+    if dups:
+        raise PackageError(f"必需项目不可重复: {', '.join(dups)}")
+    if not items:
+        raise PackageError("必需项目至少 1 个")
+    if len(items) > MAX_PACKAGE_ITEMS:
+        raise PackageError(f"必需项目最多 {MAX_PACKAGE_ITEMS} 个(当前 {len(items)} 个)")
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        placeholders = ",".join("?" for _ in items)
+        rows = conn.execute(
+            f"SELECT item, result, revision, active, withdrawn_rev FROM results"
+            f" WHERE report_no=? AND item IN ({placeholders})",
+            (report_no, *items)).fetchall()
+        by_item = {r["item"]: r for r in rows}
+        problems = []
+        for it in items:
+            r = by_item.get(it)
+            if r is None:
+                problems.append({"item": it, "reason": "缺失:正式结果中无此项目"})
+            elif not r["active"]:
+                problems.append(
+                    {"item": it, "reason": f"已撤回(撤回修订号 {r['withdrawn_rev']})"})
+        if problems:
+            conn.execute("ROLLBACK")
+            return None, problems
+        cur = conn.execute(
+            "INSERT INTO packages (report_no, status, item_count)"
+            " VALUES (?, 'active', ?)", (report_no, len(items)))
+        pid = cur.lastrowid
+        for line_no, it in enumerate(items, 1):
+            r = by_item[it]
+            conn.execute(
+                "INSERT INTO package_items (package_id, line_no, item, result, revision)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (pid, line_no, it, r["result"], r["revision"]))
+        conn.execute("COMMIT")
+        return pid, []
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+
+
+def disable_packages_for_item(conn, report_no, item, reason):
+    """增量使 (report_no,item) 的结果/修订号/有效性变化后调用(须在同事务内):
+    永久停用所有引用了该项目的可用交付包。未选项目、其他报告的包不受影响。"""
+    conn.execute(
+        """
+        UPDATE packages
+           SET status='disabled', disabled_at=datetime('now'), disabled_reason=?
+         WHERE status='active' AND report_no=? AND EXISTS (
+             SELECT 1 FROM package_items pi
+              WHERE pi.package_id = packages.id AND pi.item = ?)
+        """,
+        (reason, report_no, item))
+
+
+def list_packages(conn):
+    return conn.execute("SELECT * FROM packages ORDER BY id DESC").fetchall()
+
+
+def get_package(conn, package_id):
+    return conn.execute("SELECT * FROM packages WHERE id=?", (package_id,)).fetchone()
+
+
+def package_items(conn, package_id):
+    return conn.execute(
+        "SELECT item, result, revision FROM package_items"
+        " WHERE package_id=? ORDER BY line_no", (package_id,)).fetchall()

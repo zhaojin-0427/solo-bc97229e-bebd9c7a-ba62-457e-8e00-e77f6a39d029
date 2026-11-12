@@ -70,6 +70,29 @@ CREATE TABLE IF NOT EXISTS increments (
     effect      TEXT,                           -- applied|stale|withdrawn|recorded
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- 交付包:冻结某报告号下一组必需项目的当前正式结果与修订号。
+-- 包内任一项目的结果值/修订号/有效性被增量确认或基线切换改变时,
+-- 整包在同一事务内永久停用(status 为状态位,不随结果回改而复活)。
+CREATE TABLE IF NOT EXISTS packages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_no       TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'active', -- active | disabled
+    item_count      INTEGER NOT NULL,
+    disabled_reason TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    disabled_at     TEXT
+);
+
+-- 包内冻结的项目快照(建包时的正式结果值与修订号)
+CREATE TABLE IF NOT EXISTS package_items (
+    package_id INTEGER NOT NULL REFERENCES packages(id),
+    line_no    INTEGER NOT NULL,                -- 建包时项目的录入顺序
+    item       TEXT NOT NULL,
+    result     TEXT NOT NULL,                   -- 冻结的结果值
+    revision   INTEGER NOT NULL,                -- 冻结的修订号
+    PRIMARY KEY (package_id, item)
+);
 """
 
 

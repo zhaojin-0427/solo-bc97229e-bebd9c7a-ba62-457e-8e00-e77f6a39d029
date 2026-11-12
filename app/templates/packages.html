@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>交付包 · LIMS 检测结果同步平台</title>
+<style>
+  :root { --blue:#1f6feb; --green:#2da44e; --red:#cf222e; --gray:#57606a; --bg:#f6f8fa; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin:0; background:var(--bg); color:#1f2328; }
+  header { background:#0a3069; color:#fff; padding:14px 24px; }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { font-size:12px; opacity:.8; margin-top:4px; }
+  header a { color:#9ecbff; }
+  main { max-width:1180px; margin:0 auto; padding:18px 16px 60px; }
+  section { background:#fff; border:1px solid #d0d7de; border-radius:8px;
+            padding:16px 18px; margin-bottom:16px; }
+  h2 { font-size:15px; margin:0 0 12px; display:flex; align-items:center; gap:8px; }
+  h2 .tag { font-size:11px; font-weight:normal; color:var(--gray); }
+  button { background:var(--blue); color:#fff; border:0; border-radius:6px;
+           padding:6px 14px; font-size:13px; cursor:pointer; }
+  button:hover { filter:brightness(1.1); }
+  button.ghost { background:#fff; color:var(--blue); border:1px solid var(--blue); }
+  button:disabled { background:#eaeef2; color:#8c959f; cursor:not-allowed; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { border-bottom:1px solid #e5e9ee; padding:6px 8px; text-align:left; }
+  th { background:#f6f8fa; font-weight:600; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; }
+  .pill.active { background:#dafbe1; color:#116329; }
+  .pill.disabled { background:#ffebe9; color:#82071e; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  input[type=text] { padding:5px 8px; border:1px solid #d0d7de; border-radius:6px; font-size:13px; }
+  textarea { width:100%; max-width:520px; padding:6px 8px; border:1px solid #d0d7de;
+             border-radius:6px; font-size:13px; font-family:inherit; }
+  #toast { position:fixed; top:14px; right:14px; z-index:9; display:none; max-width:420px;
+           padding:10px 14px; border-radius:8px; color:#fff; font-size:13px;
+           box-shadow:0 4px 14px rgba(0,0,0,.2); }
+  .muted { color:var(--gray); font-size:12px; }
+  .problems { margin-top:10px; border:1px solid #ffebe9; background:#fff8f8;
+              border-radius:6px; padding:8px 12px; color:#82071e; font-size:13px; }
+  .problems li { margin:2px 0; }
+  code { background:#eff1f3; padding:1px 5px; border-radius:4px; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>交付包 · 向报告系统交付检测数据</h1>
+  <div class="sub">冻结报告号下必需项目的当前正式结果与修订号 · 包内项目的结果/修订号/有效性一旦变更即永久停用 ·
+    <a href="/">← 返回上传与取数</a></div>
+</header>
+<main>
+  <section>
+    <h2>① 新建交付包</h2>
+    <div class="row" style="margin-bottom:10px">
+      报告号:<input type="text" id="pkg-report" placeholder="如 R2026-0001">
+      <button id="btn-preview" class="ghost">查看该报告当前正式结果</button>
+    </div>
+    <div style="margin-bottom:10px">
+      <div class="muted" style="margin-bottom:4px">必需项目(1~20 个,不可重复;每行一个,或用逗号分隔):</div>
+      <textarea id="pkg-items" rows="4" placeholder="铅(Pb)&#10;镉(Cd)"></textarea>
+    </div>
+    <div class="row">
+      <button id="btn-create">建包</button>
+      <span class="muted">项目齐全时冻结其结果与修订号;缺失或已撤回将列明原因且不建包</span>
+    </div>
+    <div id="problems"></div>
+    <div id="preview-wrap" style="display:none; margin-top:12px">
+      <div class="muted" style="margin-bottom:4px">当前正式结果:</div>
+      <table id="preview">
+        <thead><tr><th>检测项目</th><th>结果</th><th>修订号</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>② 交付包列表 <span class="tag">每 1.5 秒自动刷新</span></h2>
+    <table id="packages">
+      <thead><tr><th>包号</th><th>报告号</th><th>项目数</th><th>状态</th>
+        <th>创建时间</th><th>停用时间</th><th>停用原因</th><th>操作</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section id="detail-sec" style="display:none">
+    <h2>③ 包明细 <span class="tag" id="detail-title"></span></h2>
+    <table id="detail">
+      <thead><tr><th>#</th><th>检测项目</th><th>冻结结果</th><th>冻结修订号</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+<div id="toast"></div>
+<script>
+const $ = s => document.querySelector(s);
+function toast(msg, ok=true){
+  const t = $('#toast'); t.textContent = msg;
+  t.style.background = ok ? '#2da44e' : '#cf222e'; t.style.display='block';
+  clearTimeout(t._h); t._h = setTimeout(()=>t.style.display='none', 3500);
+}
+async function j(url, opts){
+  const r = await fetch(url, opts);
+  const data = await r.json().catch(()=>({ok:false,error:'响应解析失败'}));
+  if(!r.ok){ const e = new Error(data.error || ('HTTP '+r.status)); e.data = data; e.status = r.status; throw e; }
+  return data;
+}
+function parseItems(){
+  return $('#pkg-items').value.split(/[\n,，、;；]+/).map(s=>s.trim()).filter(Boolean);
+}
+
+async function createPackage(){
+  const report_no = $('#pkg-report').value.trim();
+  const items = parseItems();
+  $('#problems').innerHTML = '';
+  try{
+    const d = await j('/packages', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({report_no, items})});
+    toast(d.message || '建包成功');
+    $('#pkg-items').value = '';
+    refreshPackages();
+  }catch(e){
+    if(e.data && e.data.problems){
+      $('#problems').innerHTML = '<div class="problems"><b>未建包,原因:</b><ul>' +
+        e.data.problems.map(p=>`<li>项目「${p.item}」:${p.reason}</li>`).join('') +
+        '</ul></div>';
+    }
+    toast(e.message, false);
+  }
+}
+
+async function preview(){
+  const rn = $('#pkg-report').value.trim();
+  if(!rn){ toast('请先填写报告号', false); return; }
+  try{
+    const d = await j('/api/results?report_no=' + encodeURIComponent(rn));
+    const tb = $('#preview tbody'); tb.innerHTML = '';
+    for(const r of d.results){
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${r.item}</td><td>${r.result}</td><td>${r.revision}</td>`;
+      tb.appendChild(tr);
+    }
+    $('#preview-wrap').style.display = '';
+    if(!d.count) toast('该报告号当前无有效正式结果', false);
+  }catch(e){ toast(e.message, false); }
+}
+
+async function refreshPackages(){
+  try{
+    const d = await j('/api/packages');
+    const tb = $('#packages tbody'); tb.innerHTML = '';
+    for(const p of d.packages){
+      const tr = document.createElement('tr');
+      const active = p.status === 'active';
+      tr.innerHTML =
+        `<td>#${p.id}</td><td>${p.report_no}</td><td>${p.item_count}</td>` +
+        `<td><span class="pill ${active?'active':'disabled'}">${active?'可用':'已停用'}</span></td>` +
+        `<td class="muted">${p.created_at}</td>` +
+        `<td class="muted">${p.disabled_at || ''}</td>` +
+        `<td class="muted">${p.disabled_reason || ''}</td>`;
+      const ops = document.createElement('td');
+      const dl = document.createElement('button');
+      dl.textContent = '下载CSV';
+      if(active){ dl.onclick = () => { window.location = `/packages/${p.id}/download`; }; }
+      else { dl.disabled = true; dl.title = '已停用,不可下载'; }
+      const det = document.createElement('button');
+      det.textContent = '明细'; det.className = 'ghost'; det.style.marginLeft = '6px';
+      det.onclick = () => showDetail(p.id);
+      ops.appendChild(dl); ops.appendChild(det);
+      tr.appendChild(ops);
+      tb.appendChild(tr);
+    }
+  }catch(e){}
+}
+
+async function showDetail(pid){
+  try{
+    const d = await j('/api/packages/' + pid);
+    const p = d.package;
+    $('#detail-title').textContent =
+      `包 #${p.id} · 报告号 ${p.report_no} · ${p.status==='active'?'可用':'已停用'}`;
+    const tb = $('#detail tbody'); tb.innerHTML = '';
+    p.items.forEach((it, i) => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${i+1}</td><td>${it.item}</td><td>${it.result}</td><td>${it.revision}</td>`;
+      tb.appendChild(tr);
+    });
+    $('#detail-sec').style.display = '';
+  }catch(e){ toast(e.message, false); }
+}
+
+$('#btn-create').addEventListener('click', createPackage);
+$('#btn-preview').addEventListener('click', preview);
+refreshPackages();
+setInterval(refreshPackages, 1500);
+</script>
+</body>
+</html>
